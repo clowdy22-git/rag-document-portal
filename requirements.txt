@@ -1,0 +1,9 @@
+pymupdf
+pytesseract
+pillow
+python-docx
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+groq
+requests

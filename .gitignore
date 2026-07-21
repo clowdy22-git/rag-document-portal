@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.faiss
+chunks.pkl
+uploaded_documents/
+cache_store.json

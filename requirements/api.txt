@@ -1,0 +1,17 @@
+# Core RAG pipeline
+pymupdf
+pytesseract
+pillow
+python-docx
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+numpy
+groq
+python-dotenv
+
+# API layer
+fastapi
+uvicorn[standard]
+python-multipart
+slowapi
