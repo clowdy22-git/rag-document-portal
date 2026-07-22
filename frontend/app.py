@@ -8,6 +8,7 @@ Run:
 """
 
 import os
+import uuid
 
 import requests
 import streamlit as st
@@ -15,8 +16,6 @@ import streamlit as st
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 API_KEY = os.environ.get("PORTAL_API_KEY", "")
 REQUEST_TIMEOUT = 120  # seconds — LLM calls can be slow, especially Ollama on CPU
-
-AUTH_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
 
 st.set_page_config(page_title="RAG Document Portal", layout="wide")
 
@@ -32,15 +31,40 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list of (role, text)
 if "documents" not in st.session_state:
     st.session_state.documents = []
+if "client_id" not in st.session_state:
+    # One random ID per Streamlit session, used to scope which documents
+    # this browser/device can see on the backend (see api/state.py's
+    # client_documents). Without this, every device sharing the same
+    # PORTAL_API_KEY would see every other device's uploaded documents —
+    # your laptop and phone would show each other's files, which is exactly
+    # what this was added to prevent.
+    #
+    # Known limitation: a hard browser refresh starts a new Streamlit
+    # session, which generates a *new* client_id — so a refreshed tab will
+    # show "no documents" even for files you uploaded moments ago in that
+    # same browser. Re-uploading the same file is instant (the content is
+    # deduplicated server-side), so this is a minor inconvenience rather
+    # than a real loss of data, but worth knowing about.
+    st.session_state.client_id = str(uuid.uuid4())
+
+HEADERS = {}
+if API_KEY:
+    HEADERS["X-API-Key"] = API_KEY
+HEADERS["X-Client-Id"] = st.session_state.client_id
 
 
 def api_reachable_error(e: requests.RequestException) -> str:
+    if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 401:
+        return (
+            "API rejected the request (401 Unauthorized) — PORTAL_API_KEY doesn't match what the "
+            "API expects. Check that the value set for this Streamlit process matches your .env file exactly."
+        )
     return f"Could not reach the API at {API_BASE} — is it running? ({e})"
 
 
 def refresh_documents():
     try:
-        resp = requests.get(f"{API_BASE}/documents", headers=AUTH_HEADERS, timeout=10)
+        resp = requests.get(f"{API_BASE}/documents", headers=HEADERS, timeout=10)
         resp.raise_for_status()
         st.session_state.documents = resp.json()
     except requests.RequestException as e:
@@ -66,7 +90,7 @@ with st.sidebar:
                 try:
                     files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
                     resp = requests.post(
-                        f"{API_BASE}/documents/upload", files=files, headers=AUTH_HEADERS, timeout=REQUEST_TIMEOUT
+                        f"{API_BASE}/documents/upload", files=files, headers=HEADERS, timeout=REQUEST_TIMEOUT
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -127,7 +151,7 @@ with tab_chat:
                                 "document_ids": selected_ids,
                                 "session_id": st.session_state.session_id,
                             },
-                            headers=AUTH_HEADERS,
+                            headers=HEADERS,
                             timeout=REQUEST_TIMEOUT,
                         )
                         if resp.status_code == 200:
@@ -159,7 +183,7 @@ with tab_compare:
                     resp = requests.post(
                         f"{API_BASE}/compare",
                         json={"document_ids": selected_ids, "topic": topic},
-                        headers=AUTH_HEADERS,
+                        headers=HEADERS,
                         timeout=REQUEST_TIMEOUT * 2,  # comparison touches multiple docs, give it more room
                     )
                     if resp.status_code == 200:

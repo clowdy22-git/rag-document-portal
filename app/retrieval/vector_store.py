@@ -31,19 +31,45 @@ class VectorStore:
         self.index.add(vectors)
         self.chunks.extend(chunks)
 
-    def search(self, query: str, top_k: int = 5) -> list[tuple[Chunk, float]]:
-        """Return the top_k most similar chunks with their similarity scores."""
+    def search(
+        self, query: str, top_k: int = 5, allowed_source_ids: list[str] | None = None
+    ) -> list[tuple[Chunk, float]]:
+        """Return the top_k most similar chunks with their similarity scores.
+
+        If allowed_source_ids is given, only chunks from those documents are
+        eligible — used to scope a search to the documents a particular
+        session/user actually selected, rather than the entire shared index.
+        """
         if self.index.ntotal == 0:
             return []
 
         query_vec = embed_query(query).reshape(1, -1)
-        scores, indices = self.index.search(query_vec, min(top_k, self.index.ntotal))
 
+        if allowed_source_ids is None:
+            scores, indices = self.index.search(query_vec, min(top_k, self.index.ntotal))
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx == -1:
+                    continue
+                results.append((self.chunks[idx], float(score)))
+            return results
+
+        # FAISS's IndexFlatIP has no native metadata filtering, so we fetch a
+        # wider candidate set from the whole index, then filter down to just
+        # the allowed documents and truncate to top_k. Fetching everything is
+        # fine here — this app's collections are small (single-user document
+        # uploads), not a large-scale index where over-fetching would matter.
+        allowed = set(allowed_source_ids)
+        scores, indices = self.index.search(query_vec, self.index.ntotal)
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx == -1:
                 continue
-            results.append((self.chunks[idx], float(score)))
+            chunk = self.chunks[idx]
+            if chunk.source_id in allowed:
+                results.append((chunk, float(score)))
+                if len(results) >= top_k:
+                    break
         return results
 
         

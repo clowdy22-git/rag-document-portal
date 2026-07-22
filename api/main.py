@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before importing app.generation.generator, which reads GROQ_API_KEY at call time
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter
@@ -94,7 +94,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Client-Id"],
 )
 
 
@@ -134,9 +134,26 @@ def require_model_ready() -> None:
         raise HTTPException(status_code=503, detail=detail)
 
 
+def require_client_id(x_client_id: str | None = Header(default=None)) -> str:
+    """Every document-touching route requires an X-Client-Id header — an
+    opaque ID the frontend generates once per browser/device and reuses for
+    the rest of that session (see frontend/app.py). This is what scopes
+    document visibility per device: without it, every device sharing the
+    one PORTAL_API_KEY would see every other device's uploaded documents,
+    which is exactly the cross-device leak this was added to close.
+
+    This is NOT authentication — X-API-Key is what proves the caller is
+    allowed to use the API at all. X-Client-Id just partitions *which*
+    documents a given caller can see, the same way a session cookie would.
+    """
+    if not x_client_id:
+        raise HTTPException(status_code=400, detail="Missing X-Client-Id header.")
+    return x_client_id
+
+
 @app.post("/documents/upload", response_model=UploadResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("10/minute")
-def upload_document(request: Request, file: UploadFile = File(...)):
+def upload_document(request: Request, file: UploadFile = File(...), client_id: str = Depends(require_client_id)):
     require_model_ready()
 
     suffix = Path(file.filename or "").suffix.lower()
@@ -163,8 +180,11 @@ def upload_document(request: Request, file: UploadFile = File(...)):
 
     source_id = make_source_id(str(dest_path))
 
-    # Same content already indexed (by this filename or another) — skip re-ingesting.
+    # Same content already indexed (by this client or another) — skip
+    # re-ingesting, but still grant *this* client visibility into it: the
+    # content is deduplicated globally, but access is scoped per client.
     if state.has_document(source_id):
+        state.grant_access(client_id, source_id)
         info = state.documents[source_id]
         return UploadResponse(document=DocumentInfo(**info), already_indexed=True)
 
@@ -183,6 +203,7 @@ def upload_document(request: Request, file: UploadFile = File(...)):
     with state.lock:
         state.store.add_chunks(chunks)
         state.register_document(source_id, file.filename or safe_name, len(pages), len(chunks))
+    state.grant_access(client_id, source_id)
 
     return UploadResponse(
         document=DocumentInfo(**state.documents[source_id]),
@@ -192,17 +213,22 @@ def upload_document(request: Request, file: UploadFile = File(...)):
 
 @app.get("/documents", response_model=list[DocumentInfo], dependencies=[Depends(verify_api_key)])
 @limiter.limit("60/minute")
-def list_documents(request: Request):
-    return [DocumentInfo(**d) for d in state.documents.values()]
+def list_documents(request: Request, client_id: str = Depends(require_client_id)):
+    return [DocumentInfo(**d) for d in state.documents_for_client(client_id)]
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("20/minute")
-def chat(request: Request, req: ChatRequest):
+def chat(request: Request, req: ChatRequest, client_id: str = Depends(require_client_id)):
     require_model_ready()
     unknown = [d for d in req.document_ids if not state.has_document(d)]
     if unknown:
         raise HTTPException(status_code=404, detail=f"Unknown document id(s): {', '.join(unknown)}")
+    not_owned = [d for d in req.document_ids if not state.client_owns(client_id, d)]
+    if not_owned:
+        raise HTTPException(
+            status_code=403, detail=f"You don't have access to document id(s): {', '.join(not_owned)}"
+        )
 
     session = state.sessions.get_or_create(req.session_id, document_ids=req.document_ids)
     history_text = session.history_as_text()
@@ -210,7 +236,10 @@ def chat(request: Request, req: ChatRequest):
     try:
         standalone_query = condense_question(req.question, history_text)
         with state.lock:
-            results = state.store.search(standalone_query, top_k=5)
+            # Scoped to req.document_ids so chat only ever draws from the
+            # documents actually selected for this session — previously this
+            # searched the entire shared index regardless of selection.
+            results = state.store.search(standalone_query, top_k=5, allowed_source_ids=req.document_ids)
 
         if not results:
             answer = "No relevant content found in the indexed documents."
@@ -229,11 +258,16 @@ def chat(request: Request, req: ChatRequest):
 
 @app.post("/compare", response_model=CompareResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("5/minute")
-def compare(request: Request, req: CompareRequest):
+def compare(request: Request, req: CompareRequest, client_id: str = Depends(require_client_id)):
     require_model_ready()
     unknown = [d for d in req.document_ids if not state.has_document(d)]
     if unknown:
         raise HTTPException(status_code=404, detail=f"Unknown document id(s): {', '.join(unknown)}")
+    not_owned = [d for d in req.document_ids if not state.client_owns(client_id, d)]
+    if not_owned:
+        raise HTTPException(
+            status_code=403, detail=f"You don't have access to document id(s): {', '.join(not_owned)}"
+        )
 
     try:
         result = compare_documents(

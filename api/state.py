@@ -38,8 +38,19 @@ class AppState:
         self.store = VectorStore()
         self.sessions = SessionManager()
         self.cache = QueryCache(path=CACHE_PATH)
-        self.documents: dict[str, dict] = {}  # source_id -> metadata
+        self.documents: dict[str, dict] = {}  # source_id -> metadata (global registry, all clients)
         self.lock = threading.Lock()  # guards all store reads/writes
+
+        # Per-client document visibility. Keyed by an opaque client_id sent
+        # in the X-Client-Id header (one generated per browser/device by the
+        # frontend — see frontend/app.py). This is deliberately separate from
+        # `documents` above: the underlying content is still deduplicated
+        # globally by content hash (two clients uploading the identical file
+        # don't re-embed it twice), but *visibility* of what's been uploaded
+        # is scoped per client — otherwise every device sharing the one
+        # PORTAL_API_KEY sees every other device's document list, which is
+        # exactly the cross-device leak this was built to close.
+        self.client_documents: dict[str, set[str]] = {}  # client_id -> {source_id, ...}
 
         # The embedding model (BGE, via sentence-transformers) takes tens of
         # seconds to load its weights on constrained CPU (e.g. Render's free
@@ -62,6 +73,19 @@ class AppState:
             "num_pages": num_pages,
             "num_chunks": num_chunks,
         }
+
+    def grant_access(self, client_id: str, source_id: str) -> None:
+        """Give a client visibility into a document — called on every
+        upload, including when the content was already indexed by someone
+        else (dedup case), since this client still needs it in their own list."""
+        self.client_documents.setdefault(client_id, set()).add(source_id)
+
+    def client_owns(self, client_id: str, source_id: str) -> bool:
+        return source_id in self.client_documents.get(client_id, set())
+
+    def documents_for_client(self, client_id: str) -> list[dict]:
+        owned = self.client_documents.get(client_id, set())
+        return [self.documents[sid] for sid in owned if sid in self.documents]
 
     def preload_model(self) -> None:
         """Load the embedding model once, synchronously — meant to be called
