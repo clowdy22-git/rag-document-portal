@@ -8,6 +8,7 @@ Run:
 """
 
 import os
+import time
 import uuid
 
 import requests
@@ -16,6 +17,15 @@ import streamlit as st
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 API_KEY = os.environ.get("PORTAL_API_KEY", "")
 REQUEST_TIMEOUT = 120  # seconds — LLM calls can be slow, especially Ollama on CPU
+
+# How many times to silently retry a request that fails with a transient,
+# cold-start-shaped error (502/503, or a dropped connection) before actually
+# showing the user an error. Render's free tier sleeps the service after 15
+# minutes idle, and the first request after that can bounce a couple of
+# times while the container wakes up — retrying here means a normal user
+# just sees a slightly slower response instead of a scary error message.
+COLD_START_RETRIES = 3
+COLD_START_RETRY_DELAY_SECONDS = 8
 
 st.set_page_config(page_title="RAG Document Portal", layout="wide")
 
@@ -62,9 +72,55 @@ def api_reachable_error(e: requests.RequestException) -> str:
     return f"Could not reach the API at {API_BASE} — is it running? ({e})"
 
 
+def _is_cold_start_error(exc: Exception | None, resp: requests.Response | None) -> bool:
+    """True for errors that look like Render's free-tier instance waking up
+    from sleep, rather than a real, permanent failure."""
+    if resp is not None and resp.status_code in (502, 503, 504):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return False
+
+
+def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """Wraps requests.request with a few silent retries for cold-start-shaped
+    failures (502/503/504, dropped connections). On the free tier, the first
+    request after 15+ minutes of inactivity can bounce like this while the
+    container wakes up — retrying here means the user just sees things take
+    a little longer, rather than an alarming error on the very first click.
+    Raises the underlying exception (or returns the last response as-is) if
+    every attempt fails, so existing error handling downstream still works.
+    """
+    last_exc: requests.RequestException | None = None
+    last_resp: requests.Response | None = None
+
+    for attempt in range(COLD_START_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < COLD_START_RETRIES and _is_cold_start_error(e, None):
+                time.sleep(COLD_START_RETRY_DELAY_SECONDS)
+                continue
+            raise
+
+        if resp.status_code in (502, 503, 504) and attempt < COLD_START_RETRIES:
+            last_resp = resp
+            time.sleep(COLD_START_RETRY_DELAY_SECONDS)
+            continue
+
+        return resp
+
+    # Exhausted retries — return the last response we got (if any) so
+    # callers' existing status-code handling still applies.
+    if last_resp is not None:
+        return last_resp
+    raise last_exc  # pragma: no cover — only reached if every attempt raised
+
+
 def refresh_documents():
     try:
-        resp = requests.get(f"{API_BASE}/documents", headers=HEADERS, timeout=10)
+        resp = request_with_retry("GET", f"{API_BASE}/documents", headers=HEADERS, timeout=10)
         resp.raise_for_status()
         st.session_state.documents = resp.json()
     except requests.RequestException as e:
@@ -89,8 +145,12 @@ with st.sidebar:
             with st.spinner(f"Ingesting '{uploaded_file.name}'..."):
                 try:
                     files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-                    resp = requests.post(
-                        f"{API_BASE}/documents/upload", files=files, headers=HEADERS, timeout=REQUEST_TIMEOUT
+                    resp = request_with_retry(
+                        "POST",
+                        f"{API_BASE}/documents/upload",
+                        files=files,
+                        headers=HEADERS,
+                        timeout=REQUEST_TIMEOUT,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -144,7 +204,8 @@ with tab_chat:
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        resp = requests.post(
+                        resp = request_with_retry(
+                            "POST",
                             f"{API_BASE}/chat",
                             json={
                                 "question": question,
@@ -180,7 +241,8 @@ with tab_compare:
         if st.button("Compare", disabled=not topic.strip()):
             with st.spinner("Comparing documents — this can take a moment..."):
                 try:
-                    resp = requests.post(
+                    resp = request_with_retry(
+                        "POST",
                         f"{API_BASE}/compare",
                         json={"document_ids": selected_ids, "topic": topic},
                         headers=HEADERS,
