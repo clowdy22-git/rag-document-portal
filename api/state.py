@@ -41,6 +41,17 @@ class AppState:
         self.documents: dict[str, dict] = {}  # source_id -> metadata
         self.lock = threading.Lock()  # guards all store reads/writes
 
+        # The embedding model (BGE, via sentence-transformers) takes tens of
+        # seconds to load its weights on constrained CPU (e.g. Render's free
+        # tier). Loading it lazily on first use — inside a request — blocks
+        # that whole process long enough to starve the health check, which
+        # gets the instance killed as "unhealthy" mid-request. Instead we
+        # kick off loading in a background thread at startup (see
+        # api/main.py's startup event) and let routes check `model_ready`
+        # to fail fast with a clear message instead of hanging into a timeout.
+        self.model_ready = False
+        self.model_load_error: str | None = None
+
     def has_document(self, source_id: str) -> bool:
         return source_id in self.documents
 
@@ -51,6 +62,17 @@ class AppState:
             "num_pages": num_pages,
             "num_chunks": num_chunks,
         }
+
+    def preload_model(self) -> None:
+        """Load the embedding model once, synchronously — meant to be called
+        from a background thread at startup, not on the event loop."""
+        try:
+            from app.retrieval.embeddings import get_model
+
+            get_model()
+            self.model_ready = True
+        except Exception as e:
+            self.model_load_error = str(e)
 
 
 # Single shared instance used by all routes.

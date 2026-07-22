@@ -24,6 +24,7 @@ Dependencies (in addition to the app/ pipeline's own):
 """
 
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -97,17 +98,47 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def start_model_preload():
+    """Kick off embedding-model loading in a background thread as soon as
+    the app starts, instead of lazily on the first request. Loading the
+    model (tens of seconds on constrained CPU, e.g. Render's free tier)
+    inside a request handler blocks that worker long enough to starve the
+    health check, which can get the whole instance killed as "unhealthy"
+    mid-request — this is what caused the 502s on first upload after a
+    cold start. Running it in a plain thread (not asyncio.to_thread, since
+    this fires before the event loop is guaranteed to be pumping yet) lets
+    /health keep responding immediately while the model loads in parallel.
+    """
+    threading.Thread(target=state.preload_model, daemon=True).start()
+
+
 @app.get("/health", response_model=HealthResponse)
 def health():
-    # Intentionally unauthenticated and unrate-limited: ECS/ALB health checks
-    # hit this frequently without credentials. Keep this handler free of
-    # anything sensitive.
-    return HealthResponse(status="ok", documents_indexed=len(state.documents))
+    # Intentionally unauthenticated and unrate-limited: ECS/ALB/Render health
+    # checks hit this frequently without credentials, and it must never block
+    # on the embedding model — see start_model_preload above for why.
+    return HealthResponse(status="ok", documents_indexed=len(state.documents), model_ready=state.model_ready)
+
+
+def require_model_ready() -> None:
+    """Raise a clear 503 if the embedding model hasn't finished loading yet,
+    rather than letting the request hang until it times out into a 502.
+    Shared by every route that touches the vector store (upload, chat, compare)."""
+    if not state.model_ready:
+        detail = (
+            f"Embedding model failed to load: {state.model_load_error}"
+            if state.model_load_error
+            else "The embedding model is still warming up after a cold start (usually under a minute) — please retry shortly."
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
 
 @app.post("/documents/upload", response_model=UploadResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("10/minute")
 def upload_document(request: Request, file: UploadFile = File(...)):
+    require_model_ready()
+
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -168,6 +199,7 @@ def list_documents(request: Request):
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("20/minute")
 def chat(request: Request, req: ChatRequest):
+    require_model_ready()
     unknown = [d for d in req.document_ids if not state.has_document(d)]
     if unknown:
         raise HTTPException(status_code=404, detail=f"Unknown document id(s): {', '.join(unknown)}")
@@ -198,6 +230,7 @@ def chat(request: Request, req: ChatRequest):
 @app.post("/compare", response_model=CompareResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("5/minute")
 def compare(request: Request, req: CompareRequest):
+    require_model_ready()
     unknown = [d for d in req.document_ids if not state.has_document(d)]
     if unknown:
         raise HTTPException(status_code=404, detail=f"Unknown document id(s): {', '.join(unknown)}")

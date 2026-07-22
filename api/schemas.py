@@ -38,3 +38,4 @@ class CompareResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     documents_indexed: int
+    model_ready: bool
