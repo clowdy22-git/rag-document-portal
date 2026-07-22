@@ -25,9 +25,26 @@ RUN pip install --no-cache-dir -r requirements/api.txt
 COPY app ./app
 COPY api ./api
 
+# Pre-download the embedding model into the image at BUILD time, not runtime.
+# Without this, the first request after every cold start (Render's free tier
+# sleeps the container after 15min idle) triggers a live download from
+# Hugging Face Hub — slow and unauthenticated, easily slow enough to blow
+# past the request timeout and surface as a 502 Bad Gateway to the caller.
+# Baking it in means the model is already on disk before uvicorn even starts.
+#
+# HF_HOME is set explicitly (rather than the default ~/.cache) because this
+# RUN executes as root, and root's home dir isn't world-readable — appuser
+# (below) wouldn't be able to reach the cache otherwise.
+ENV HF_HOME=/app/hf_cache
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
+
 RUN useradd --create-home --uid 1000 appuser
 ENV DATA_DIR=/app/data
 ENV PORT=8000
+# HF_HUB_OFFLINE: belt-and-suspenders — forces sentence-transformers to use
+# only the model baked in above and never attempt a network call, so a
+# transient Hugging Face outage can't cause a runtime failure either.
+ENV HF_HUB_OFFLINE=1
 RUN mkdir -p /app/data && chown -R appuser:appuser /app
 USER appuser
 
