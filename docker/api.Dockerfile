@@ -19,6 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Limits thread-pool sizes for torch/tokenizers, which otherwise default to
+# spawning one thread per detected CPU core. On a shared/throttled host
+# (e.g. Render's free tier) that default creates more contention and
+# per-thread memory overhead than it's worth for a single small model.
+ENV OMP_NUM_THREADS=1
+ENV TOKENIZERS_PARALLELISM=false
+
 COPY requirements/api.txt ./requirements/api.txt
 RUN pip install --no-cache-dir -r requirements/api.txt
 

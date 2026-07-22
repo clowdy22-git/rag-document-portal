@@ -1,4 +1,14 @@
 # Core RAG pipeline
+#
+# torch is pinned to the CPU-only build BEFORE sentence-transformers so pip
+# resolves against this lightweight wheel instead of the default build,
+# which bundles CUDA/GPU libraries we never use on this deployment. The
+# default build is several hundred MB heavier at runtime — on a memory-
+# constrained host (e.g. Render's free 512MB tier) that overhead alone was
+# enough to OOM-kill the process mid-model-load.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
 pymupdf
 pytesseract
 pillow
