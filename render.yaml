@@ -1,0 +1,36 @@
+# Render Blueprint — deploys both services from this repo's existing Dockerfiles.
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Usage: push this file to the repo root (or leave it here and point Render at
+# this path), then in the Render dashboard: New -> Blueprint -> select this repo.
+# Render reads this file and provisions both services automatically.
+
+services:
+  - type: web
+    name: rag-portal-api
+    runtime: docker
+    dockerfilePath: ./docker/api.Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set manually in the Render dashboard — never in this file or git
+      - key: PORTAL_API_KEY
+        sync: false          # same — generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - key: ALLOWED_ORIGINS
+        value: "https://rag-portal-frontend.onrender.com"  # update after the frontend's real URL is known
+      - key: DATA_DIR
+        value: /app/data
+
+  - type: web
+    name: rag-portal-frontend
+    runtime: docker
+    dockerfilePath: ./docker/frontend.Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: API_BASE
+        value: "https://rag-portal-api.onrender.com"  # update after the API's real URL is known
+      - key: PORTAL_API_KEY
+        sync: false          # must match the API service's PORTAL_API_KEY exactly

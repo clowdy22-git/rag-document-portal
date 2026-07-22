@@ -1,0 +1,16 @@
+**/__pycache__/
+**/*.pyc
+.venv/
+.git/
+.github/
+.env
+*.env
+!.env.example
+uploaded_documents/
+cache_store.json
+data/
+*.zip
+infra/
+docker-compose.yml
+README.md
+DEPLOYMENT.md
