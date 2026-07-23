@@ -57,7 +57,15 @@ from api.schemas import (
 )
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25MB — generous for text-heavy docs, blocks accidental huge files
+# Confirmed via real-world testing: on Render's free tier, a 20MB PDF's
+# extract+chunk+embed pipeline takes long enough that Render's own proxy
+# (not something we control) drops the connection before a response comes
+# back — surfacing to the caller as "connection ended prematurely," even
+# though the app itself is working correctly. Small files (a page or two)
+# complete fine. This default reflects free-tier CPU + proxy timeout reality,
+# not a fixed technical ceiling — raise MAX_UPLOAD_MB if you move to a host
+# with more CPU headroom or a longer/no proxy timeout.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "5")) * 1024 * 1024
 
 
 def rate_limit_key(request: Request) -> str:

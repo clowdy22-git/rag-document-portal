@@ -141,6 +141,14 @@ with st.sidebar:
 
     uploaded_file = st.file_uploader("Upload a PDF or DOCX", type=["pdf", "docx"])
     if uploaded_file is not None:
+        size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+        if size_mb > 5:
+            st.warning(
+                f"This file is {size_mb:.1f}MB. On this hosting tier, large files "
+                "(roughly 5MB+) often take longer to process than the server will wait, "
+                "and the upload will fail partway through. Smaller files (a few pages) "
+                "work reliably — consider splitting or trimming this document if possible."
+            )
         if st.button("Ingest document", use_container_width=True):
             with st.spinner(f"Ingesting '{uploaded_file.name}'..."):
                 try:
