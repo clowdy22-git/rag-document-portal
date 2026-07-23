@@ -63,6 +63,18 @@ class AppState:
         self.model_ready = False
         self.model_load_error: str | None = None
 
+        # Background upload processing. Large files can take longer to
+        # extract+chunk+embed than a hosting platform's own proxy is willing
+        # to hold a connection open for (confirmed in practice: a 20MB PDF
+        # reliably got its connection dropped mid-request on Render's free
+        # tier, well before our own code finished or failed). Instead of one
+        # long blocking request, upload now returns immediately with a job
+        # id, does the real work in a background thread, and the frontend
+        # polls /documents/status/{source_id} until it's done — no single
+        # HTTP request stays open long enough to hit any proxy timeout.
+        self.upload_jobs: dict[str, dict] = {}  # source_id -> {"status", "error"}
+        self.jobs_lock = threading.Lock()  # guards upload_jobs and client_documents
+
     def has_document(self, source_id: str) -> bool:
         return source_id in self.documents
 
@@ -78,7 +90,8 @@ class AppState:
         """Give a client visibility into a document — called on every
         upload, including when the content was already indexed by someone
         else (dedup case), since this client still needs it in their own list."""
-        self.client_documents.setdefault(client_id, set()).add(source_id)
+        with self.jobs_lock:
+            self.client_documents.setdefault(client_id, set()).add(source_id)
 
     def client_owns(self, client_id: str, source_id: str) -> bool:
         return source_id in self.client_documents.get(client_id, set())
@@ -86,6 +99,22 @@ class AppState:
     def documents_for_client(self, client_id: str) -> list[dict]:
         owned = self.client_documents.get(client_id, set())
         return [self.documents[sid] for sid in owned if sid in self.documents]
+
+    def start_job(self, source_id: str) -> None:
+        with self.jobs_lock:
+            self.upload_jobs[source_id] = {"status": "processing", "error": None}
+
+    def finish_job(self, source_id: str) -> None:
+        with self.jobs_lock:
+            self.upload_jobs[source_id] = {"status": "done", "error": None}
+
+    def fail_job(self, source_id: str, error: str) -> None:
+        with self.jobs_lock:
+            self.upload_jobs[source_id] = {"status": "error", "error": error}
+
+    def job_status(self, source_id: str) -> dict | None:
+        with self.jobs_lock:
+            return self.upload_jobs.get(source_id)
 
     def preload_model(self) -> None:
         """Load the embedding model once, synchronously — meant to be called

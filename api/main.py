@@ -48,6 +48,7 @@ from api.state import state, UPLOAD_DIR
 from api.auth import verify_api_key
 from api.schemas import (
     UploadResponse,
+    UploadStatusResponse,
     DocumentInfo,
     ChatRequest,
     ChatResponse,
@@ -57,15 +58,12 @@ from api.schemas import (
 )
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
-# Confirmed via real-world testing: on Render's free tier, a 20MB PDF's
-# extract+chunk+embed pipeline takes long enough that Render's own proxy
-# (not something we control) drops the connection before a response comes
-# back — surfacing to the caller as "connection ended prematurely," even
-# though the app itself is working correctly. Small files (a page or two)
-# complete fine. This default reflects free-tier CPU + proxy timeout reality,
-# not a fixed technical ceiling — raise MAX_UPLOAD_MB if you move to a host
-# with more CPU headroom or a longer/no proxy timeout.
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "5")) * 1024 * 1024
+# Upload processing (extract/chunk/embed/index) now happens in a background
+# thread — see _process_upload_job below — so the proxy-timeout problem that
+# motivated a small limit no longer applies (no single HTTP request stays
+# open during the slow work anymore). This ceiling is now just a sane
+# sanity limit against accidental huge uploads, not a timeout workaround.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 
 
 def rate_limit_key(request: Request) -> str:
@@ -159,6 +157,38 @@ def require_client_id(x_client_id: str | None = Header(default=None)) -> str:
     return x_client_id
 
 
+def _process_upload_job(dest_path: Path, source_id: str, filename: str, client_id: str) -> None:
+    """The actual extract -> chunk -> embed -> index work, run in a
+    background thread so the HTTP request that triggered it can return
+    immediately. See UploadResponse/UploadStatusResponse and the comment on
+    MAX_UPLOAD_BYTES above for why: large files can take longer than a
+    hosting platform's proxy will hold a connection open for, so no request
+    handler does this work synchronously anymore."""
+    try:
+        pages = extract(str(dest_path), source_id=source_id)
+    except Exception as e:
+        state.fail_job(source_id, f"Failed to extract document: {e}")
+        return
+
+    chunks = chunk_pages(pages)
+    if not chunks:
+        state.fail_job(
+            source_id, "No extractable text found in this document (empty, corrupted, or unreadable scan)."
+        )
+        return
+
+    try:
+        with state.lock:
+            state.store.add_chunks(chunks)
+            state.register_document(source_id, filename, len(pages), len(chunks))
+    except Exception as e:
+        state.fail_job(source_id, f"Failed to index document: {e}")
+        return
+
+    state.grant_access(client_id, source_id)
+    state.finish_job(source_id)
+
+
 @app.post("/documents/upload", response_model=UploadResponse, dependencies=[Depends(verify_api_key)])
 @limiter.limit("10/minute")
 def upload_document(request: Request, file: UploadFile = File(...), client_id: str = Depends(require_client_id)):
@@ -191,32 +221,53 @@ def upload_document(request: Request, file: UploadFile = File(...), client_id: s
     # Same content already indexed (by this client or another) — skip
     # re-ingesting, but still grant *this* client visibility into it: the
     # content is deduplicated globally, but access is scoped per client.
+    # This path is fast (no extraction/embedding needed) so it stays
+    # synchronous and returns "done" immediately — no polling required.
     if state.has_document(source_id):
         state.grant_access(client_id, source_id)
         info = state.documents[source_id]
-        return UploadResponse(document=DocumentInfo(**info), already_indexed=True)
-
-    try:
-        pages = extract(str(dest_path), source_id=source_id)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to extract document: {e}")
-
-    chunks = chunk_pages(pages)
-    if not chunks:
-        raise HTTPException(
-            status_code=422,
-            detail="No extractable text found in this document (empty, corrupted, or unreadable scan).",
+        return UploadResponse(
+            source_id=source_id, status="done", already_indexed=True, document=DocumentInfo(**info)
         )
 
-    with state.lock:
-        state.store.add_chunks(chunks)
-        state.register_document(source_id, file.filename or safe_name, len(pages), len(chunks))
-    state.grant_access(client_id, source_id)
+    # New content: kick off the real work in the background and return
+    # immediately. The frontend polls GET /documents/status/{source_id}
+    # until this reports "done" or "error".
+    state.start_job(source_id)
+    threading.Thread(
+        target=_process_upload_job,
+        args=(dest_path, source_id, file.filename or safe_name, client_id),
+        daemon=True,
+    ).start()
 
-    return UploadResponse(
-        document=DocumentInfo(**state.documents[source_id]),
-        already_indexed=False,
-    )
+    return UploadResponse(source_id=source_id, status="processing", already_indexed=False, document=None)
+
+
+@app.get(
+    "/documents/status/{source_id}", response_model=UploadStatusResponse, dependencies=[Depends(verify_api_key)]
+)
+@limiter.limit("120/minute")  # polled frequently by the frontend while a large upload processes
+def upload_status(request: Request, source_id: str, client_id: str = Depends(require_client_id)):
+    job = state.job_status(source_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No upload job found for source_id '{source_id}'.")
+
+    if job["status"] == "done":
+        if not state.client_owns(client_id, source_id):
+            # Job finished (possibly kicked off by this same client before a
+            # page reload generated a new client_id — see the known
+            # client_id limitation noted in frontend/app.py) — grant access
+            # now that we can confirm the document exists.
+            state.grant_access(client_id, source_id)
+        info = state.documents.get(source_id)
+        return UploadStatusResponse(
+            source_id=source_id, status="done", document=DocumentInfo(**info) if info else None
+        )
+
+    if job["status"] == "error":
+        return UploadStatusResponse(source_id=source_id, status="error", error=job["error"])
+
+    return UploadStatusResponse(source_id=source_id, status="processing")
 
 
 @app.get("/documents", response_model=list[DocumentInfo], dependencies=[Depends(verify_api_key)])

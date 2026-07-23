@@ -11,8 +11,17 @@ class DocumentInfo(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    document: DocumentInfo
+    source_id: str
+    status: str  # "processing" (background job started) or "done" (dedup hit, no work needed)
     already_indexed: bool
+    document: DocumentInfo | None = None  # populated when status == "done"
+
+
+class UploadStatusResponse(BaseModel):
+    source_id: str
+    status: str  # "processing" | "done" | "error"
+    document: DocumentInfo | None = None
+    error: str | None = None
 
 
 class ChatRequest(BaseModel):

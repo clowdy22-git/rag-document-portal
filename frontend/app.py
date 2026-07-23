@@ -142,35 +142,69 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload a PDF or DOCX", type=["pdf", "docx"])
     if uploaded_file is not None:
         size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-        if size_mb > 5:
-            st.warning(
-                f"This file is {size_mb:.1f}MB. On this hosting tier, large files "
-                "(roughly 5MB+) often take longer to process than the server will wait, "
-                "and the upload will fail partway through. Smaller files (a few pages) "
-                "work reliably — consider splitting or trimming this document if possible."
+        if size_mb > 15:
+            st.info(
+                f"This file is {size_mb:.1f}MB — larger files take longer to process "
+                "(extraction + embedding happens in the background, so this won't time out, "
+                "but it may take a couple of minutes for a big document)."
             )
         if st.button("Ingest document", use_container_width=True):
-            with st.spinner(f"Ingesting '{uploaded_file.name}'..."):
-                try:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-                    resp = request_with_retry(
-                        "POST",
-                        f"{API_BASE}/documents/upload",
-                        files=files,
-                        headers=HEADERS,
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data["already_indexed"]:
-                            st.info(f"'{uploaded_file.name}' was already indexed — reused the existing copy.")
-                        else:
-                            st.success(f"Indexed '{uploaded_file.name}' — {data['document']['num_chunks']} chunks.")
+            try:
+                files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
+                resp = request_with_retry(
+                    "POST",
+                    f"{API_BASE}/documents/upload",
+                    files=files,
+                    headers=HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data["already_indexed"]:
+                        st.info(f"'{uploaded_file.name}' was already indexed — reused the existing copy.")
                         refresh_documents()
+                    elif data["status"] == "processing":
+                        # Large-file fix: extraction/chunking/embedding runs in the
+                        # background on the server (see api/main.py's
+                        # _process_upload_job), so no single request stays open
+                        # long enough to hit a hosting platform's proxy timeout.
+                        # Poll the status endpoint here instead of waiting on one
+                        # long response.
+                        source_id = data["source_id"]
+                        with st.spinner(f"Processing '{uploaded_file.name}'... this can take a while for larger files."):
+                            max_polls = 60  # ~5 minutes at 5s intervals — generous for a large/scanned document
+                            for _ in range(max_polls):
+                                time.sleep(5)
+                                status_resp = request_with_retry(
+                                    "GET",
+                                    f"{API_BASE}/documents/status/{source_id}",
+                                    headers=HEADERS,
+                                    timeout=15,
+                                )
+                                if status_resp.status_code != 200:
+                                    st.error(f"Lost track of upload status: {error_detail(status_resp)}")
+                                    break
+                                status_data = status_resp.json()
+                                if status_data["status"] == "done":
+                                    chunks = status_data["document"]["num_chunks"] if status_data["document"] else "?"
+                                    st.success(f"Indexed '{uploaded_file.name}' — {chunks} chunks.")
+                                    refresh_documents()
+                                    break
+                                if status_data["status"] == "error":
+                                    st.error(f"Upload failed: {status_data['error']}")
+                                    break
+                            else:
+                                st.warning(
+                                    "Still processing after several minutes — click 'Refresh list' in a "
+                                    "moment to check if it finished, rather than re-uploading."
+                                )
                     else:
-                        st.error(f"Upload failed: {error_detail(resp)}")
-                except requests.RequestException as e:
-                    st.error(api_reachable_error(e))
+                        st.success(f"Indexed '{uploaded_file.name}' — {data['document']['num_chunks']} chunks.")
+                        refresh_documents()
+                else:
+                    st.error(f"Upload failed: {error_detail(resp)}")
+            except requests.RequestException as e:
+                st.error(api_reachable_error(e))
 
     if st.button("Refresh list", use_container_width=True):
         refresh_documents()
