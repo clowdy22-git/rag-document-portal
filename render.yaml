@@ -22,6 +22,8 @@ services:
         value: "https://rag-portal-frontend.onrender.com"  # update after the frontend's real URL is known
       - key: DATA_DIR
         value: /app/data
+      - key: EMBEDDING_BATCH_SIZE
+        value: "8"  # lower = safer on constrained memory (free tier), higher = faster ingestion if you upgrade
 
   - type: web
     name: rag-portal-frontend
