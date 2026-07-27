@@ -1,2 +1,11 @@
 [client]
 toolbarMode = "minimal"
+
+[server]
+# Matches api/main.py's MAX_UPLOAD_MB default (25). Keep these in sync —
+# this is what actually controls the "Limit XXXMB per file" caption shown
+# under the file uploader (Streamlit defaults to 200MB otherwise), and
+# rejects oversized files here in the browser before they're even sent,
+# rather than relying on the backend's own check.
+maxUploadSize = 25
+

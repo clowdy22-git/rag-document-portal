@@ -129,11 +129,20 @@ def refresh_documents():
 
 def error_detail(resp: requests.Response) -> str:
     """Pull the FastAPI 'detail' field out of an error response, falling
-    back to raw text if the body isn't the JSON shape we expect."""
+    back to a clean summary if the body isn't the JSON shape we expect —
+    e.g. a proxy-level error page (502/504) is raw HTML, not JSON from our
+    own app, and dumping that verbatim into the chat is unreadable noise."""
     try:
         return resp.json().get("detail", resp.text)
     except ValueError:
-        return resp.text or f"HTTP {resp.status_code}"
+        text = resp.text or ""
+        if text.strip().lower().startswith(("<!doctype", "<html")):
+            return (
+                f"Server returned an error page (HTTP {resp.status_code}) instead of a normal "
+                "response — likely a temporary gateway/proxy issue rather than an app error. "
+                "Please wait a moment and try again."
+            )
+        return text or f"HTTP {resp.status_code}"
 
 
 with st.sidebar:
@@ -141,13 +150,6 @@ with st.sidebar:
 
     uploaded_file = st.file_uploader("Upload a PDF or DOCX", type=["pdf", "docx"])
     if uploaded_file is not None:
-        size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-        if size_mb > 15:
-            st.info(
-                f"This file is {size_mb:.1f}MB — larger files take longer to process "
-                "(extraction + embedding happens in the background, so this won't time out, "
-                "but it may take a couple of minutes for a big document)."
-            )
         if st.button("Ingest document", use_container_width=True):
             try:
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
